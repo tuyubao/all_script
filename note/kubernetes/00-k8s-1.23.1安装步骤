@@ -1,0 +1,173 @@
+k8s1.23.1版本安装步骤，kubeadm方式安装
+
+一、初始化配置
+	1、规划
+		k8s集群角色		主机名		IP地址		安装的组件
+		控制节点		master01	10.0.0.11	apiserver controller-manager scheduler etcd kube-proxy docker calico
+		工作节点		worker01	10.0.0.31	kubelet kube-proxy calico coredns
+	2、配置主机名
+	3、配置hosts解析文件
+		vim /etc/hosts
+	4、配置主机间免密登录
+		ssh-keygen
+		ssh-copy-id -i /root/.ssh/id_rsa.pub  master01
+	5、关闭交换分区
+		swapoff -a 		# 临时关闭
+		vim /etc/fstab
+		#UUID=55253820-9ce5-4778-b70b-25512874e56a swap                    swap    defaults        0 0
+	6、修改内核参数
+		modprobe br_netfilter
+		echo "modprobe br_netfilter" >> /etc/profile
+		cat > /etc/sysctl.d/k8s.conf <<EOF
+		net.bridge.bridge-nf-call-ip6tables = 1
+		net.bridge.bridge-nf-call-iptables = 1
+		net.ipv4.ip_forward = 1
+		EOF
+		sysctl -p /etc/sysctl.d/k8s.conf
+	7、关闭防火墙，selinux
+		systemctl disable firewalld --now
+		setenforce 0		# 临时关闭
+		sed -i 's/SELINUX=enforcing/SELINUX=disabled/g' /etc/selinux/config  # 永久关闭
+	8、配置yum源，安装常用基础包	
+		删除其他的源：
+		rm -rf /etc/yum.repos.d/*
+		基础源：
+		wget -O /etc/yum.repos.d/CentOS-Base.repo https://mirrors.aliyun.com/repo/Centos-7.repo
+		扩展源：
+		wget -O /etc/yum.repos.d/epel.repo https://mirrors.aliyun.com/repo/epel-7.repo
+		docker源：
+		yum install -y yum-utils device-mapper-persistent-data lvm2
+		yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+		kubernetes源：
+		cat > /etc/yum.repos.d/kubernetes.repo << EOF
+		[kubernetes]
+		name=Kubernetes
+		baseurl=https://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64/
+		enabled=1
+		gpgcheck=0
+		EOF
+		安装软件包：
+		yum install -y vim wget bash-completion net-tools yum-utils
+	9、配置时间同步
+		yum install -y  ntpdate
+		ntpdate cn.pool.ntp.org
+		crontab -e		# 将时间同步加入计划任务，每小时进行一次时将同步
+		* */1 * * * /usr/sbin/ntpdate   cn.pool.ntp.org
+		systemctl restart crond  # 重启计划任务服务
+	10、开启ipvs
+		[root@master01 ~]# mv ipvs.modules  /etc/sysconfig/modules/
+		[root@master01 ~]# chmod 755 /etc/sysconfig/modules/ipvs.modules && bash /etc/sysconfig/modules/ipvs.modules && lsmod | grep ip_vs
+		ip_vs_ftp              13079  0 
+		nf_nat                 26583  1 ip_vs_ftp
+		ip_vs_sed              12519  0 
+		ip_vs_nq               12516  0 
+		ip_vs_sh               12688  0 
+		ip_vs_dh               12688  0 
+		ip_vs_lblcr            12922  0 
+		ip_vs_lblc             12819  0 
+		ip_vs_wrr              12697  0 
+		ip_vs_rr               12600  0 
+		ip_vs_wlc              12519  0 
+		ip_vs_lc               12516  0 
+		ip_vs                 145458  22 ip_vs_dh,ip_vs_lc,ip_vs_nq,ip_vs_rr,ip_vs_sh,ip_vs_ftp,ip_vs_sed,ip_vs_wlc,ip_vs_wrr,ip_vs_lblcr,ip_vs_lblc
+		nf_conntrack          139264  2 ip_vs,nf_nat
+		libcrc32c              12644  4 xfs,ip_vs,nf_nat,nf_conntrack
+	
+二、安装docker
+	1、安装dokcer
+		yum install -y docker-ce
+		docker --version
+		systemctl enabeld docker --now
+		systemctl status docker
+	2、配置镜像加速器
+		阿里云容器镜像服务-->镜像工具-->镜像加速器
+		sudo mkdir -p /etc/docker
+		sudo tee /etc/docker/daemon.json <<-'EOF'
+		{
+		"registry-mirrors": ["https://t37y9kai.mirror.aliyuncs.com"],
+		"exec-opts": ["native.cgroupdriver=systemd"]					# 将docker交给systemd管理
+		}
+		EOF
+		sudo systemctl daemon-reload
+		sudo systemctl restart docker
+	
+三、初始化k8s
+	1、安装软件包
+		yum install -y kubelet-1.23.1-0.x86_64 kubeadm-1.23.1-0.x86_64 kubectl-1.23.1-0.x86_64
+		systemctl start kubelet
+	2、初始化k8s集群
+		kubeadm init --kubernetes-version=1.23.1 --apiserver-advertise-address=10.0.0.11 --image-repository registry.aliyuncs.com/google_containers --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=SystemVerification
+		注：--image-repository registry.aliyuncs.com/google_containers：手动指定仓库地址为registry.aliyuncs.com/google_containers。
+		kubeadm默认从k8s.grc.io拉取镜像，但是k8s.gcr.io访问不到，所以需要指定从registry.aliyuncs.com/google_containers仓库拉取镜像。
+		
+	3、添加工作节点
+		kubeadm join 10.0.0.11:6443 --token 7rcew9.c3agekch3nfzra1p \
+        --discovery-token-ca-cert-hash sha256:b60bd045e68045083a1ce5b9f273eca9f95fd139b4bbdde40f32e9daf1c7f4db \
+		--ignore-preflight-errors=SystemVerification
+	
+四、安装网络组件calico
+	上传calico.yaml文件到master节点
+	kubectl apply -f calico.yaml
+	再次查看各个节点的状态，状态已经变为Ready
+	[root@master01 ~]# kubectl get node
+	NAME       STATUS   ROLES                  AGE     VERSION
+	master01   Ready    control-plane,master   11m     v1.23.1
+	worker01   Ready    worker                 7m10s   v1.23.1
+
+
+五、安装成功后正常运行以下pod
+[root@master01 ~]# watch kubectl get pod -n kube-system -o wide
+Every 2.0s: kubectl get pod -n kube-system -o wide                                                          Thu Dec  8 12:03:51 2022
+
+NAME                                       READY   STATUS    RESTARTS   AGE     IP               NODE       NOMINATED NODE   READINE
+SS GATES          
+calico-kube-controllers-677cd97c8d-2v26k   1/1     Running   0          2m2s    10.244.5.3       worker01   <none>           <none>
+calico-node-s788p                          1/1     Running   0          2m2s    192.168.100.11   master01   <none>           <none>
+calico-node-ztrhh                          1/1     Running   0          2m2s    192.168.100.31   worker01   <none>           <none>
+coredns-6d8c4cb4d-4zqjb                    1/1     Running   0          5m24s   10.244.5.2       worker01   <none>           <none>
+coredns-6d8c4cb4d-grg2b                    1/1     Running   0          5m24s   10.244.5.1       worker01   <none>           <none>
+etcd-master01                              1/1     Running   0          5m39s   192.168.100.11   master01   <none>           <none>
+kube-apiserver-master01                    1/1     Running   0          5m38s   192.168.100.11   master01   <none>           <none>
+kube-controller-manager-master01           1/1     Running   0          5m37s   192.168.100.11   master01   <none>           <none>
+kube-proxy-6vksq                           1/1     Running   0          5m24s   192.168.100.11   master01   <none>           <none>
+kube-proxy-lzhl9                           1/1     Running   0          3m12s   192.168.100.31   worker01   <none>           <none>
+kube-scheduler-master01                    1/1     Running   0          5m37s   192.168.100.11   master01   <none>           <none>
+
+
+
+
+六、补充命令
+kubeadm token create --print-join-command			# 生成添加工作节点的命令（在master节点上执行）
+kubectl label node worker01 node-role.kubernetes.io/worker=worker		# 给worker几点打标签
+[root@master01 ~]# kubectl get node
+NAME       STATUS     ROLES                  AGE     VERSION
+master01   NotReady   control-plane,master   8m39s   v1.23.1
+worker01   NotReady   worker                 4m35s   v1.23.1
+
+配置kubectl命令补全
+yum install bash-completion		# kubectl命令补全依赖于这个软甲包，大部分软件的命令补全都依赖与这个软件包
+
+echo 'source <(kubectl completion bash)' >>~/.bashrc		# 生效与当前root用户
+source <(kubectl completion bash)							#立即生效
+
+kubectl completion bash | sudo tee /etc/bash_completion.d/kubectl > /dev/null		#全局神效
+
+实时查看pod的运行状态
+watch kubectl get pod -n kube-system -o wide
+
+
+允许将pod调度到master节点
+[root@master yaml]# kubectl taint node master node-role.kubernetes.io/master-
+参数：
+master：节点名
+node-role.kubernetes.io/master：节点上的污点标签名，后加 “-” 即可删除此污点
+
+node/master untainted 
+[root@master yaml]# kubectl describe nodes master | grep Taint
+Taints:             <none>
+
+
+
+
+
+
